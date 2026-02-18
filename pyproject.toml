@@ -2,14 +2,13 @@
 name = "pufferlib"
 version = "3.0.0"
 description = "Fast and sane reinforcement learning"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 readme = {file = "README.md", content-type = "text/markdown"}
 license = {text = "MIT"}
 authors = [{ name = "Joseph Suarez", email = "jsuarez@puffer.ai" }]
 classifiers=[
     "Intended Audience :: Science/Research",
     "Intended Audience :: Developers",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -31,162 +30,62 @@ dynamic = ["dependencies"]
 #'gymnasium==0.29.1',
 #'pettingzoo==1.24.1',
 [project.optional-dependencies]
-avalon = [
-    'gymnasium==0.29.1',
-    'avalon-rl==1.0.0',
-]
-
 atari = [
-    'gymnasium[accept-rom-license]==0.29.1',
-    'opencv-python==3.4.17.63',
-    'ale_py==0.9.0',
+    'gymnasium>=1.2.2',
+    'opencv-python>=3.4.17.63',
+    'ale_py>=0.9.0',
 ]
 
 box2d = [
-    'gymnasium[box2d]==0.29.1',
+    'gymnasium[box2d]>=1.2.2',
     'swig==4.1.1',
 ]
 
-bsuite = [
-    'gym==0.23',
-    'gymnasium==0.29.1',
-    'bsuite==0.3.5',
-]
-
 butterfly = [
-    'gym==0.23',
-    'gymnasium==0.29.1',
+    'gymnasium>=1.2.2',
     'pettingzoo[butterfly]==1.24.1',
 ]
 
 classic_control = [
-    'gym==0.23',
-    'gymnasium==0.29.1',
-]
-
-crafter = [
-    'gym==0.23',
-    'gymnasium==0.29.1',
-    'crafter==1.8.3',
+    'gymnasium>=1.2.2',
 ]
 
 craftax = [
-    'gymnasium==0.29.1',
+    'gymnasium>=1.2.2',
     'craftax',
 ]
 
-dm_control = [
-    'gym==0.23',
-    'gymnasium==0.29.1',
-    'dm_control==1.0.11',
-]
-
-dm_lab = [
-    'gym==0.23',
-    'gymnasium==0.29.1',
-    'gym_deepmindlab==0.1.2',
-    'dm_env==1.6',
-]
-
-griddly = [
-    'gym==0.23',
-    'gymnasium==0.29.1',
-    'griddly==1.6.7',
-    'imageio',
-]
-
 kinetix = [
-    'gym==0.23',
-    'gymnasium==0.29.1',
+    'gymnasium>=1.2.2',
     'kinetix-env',
 ]
 
 magent = [
-    'gym==0.23',
-    'gymnasium==0.29.1',
-    'pettingzoo==1.19.0',
+    'gymnasium>=1.2.2',
+    'pettingzoo>=1.24.1',
     'magent==0.2.4',
     # The Magent2 package is broken for now
     #'magent2==0.3.2',
 ]
 
-metta = [
-    'gym==0.23',
-    'gymnasium==0.29.1',
-    'omegaconf',
-    'hydra-core',
-    'duckdb',
-    'raylib>=5.5.0',
-    'mettagrid @ git+https://github.com/metta-ai/mettagrid.git',
-    'cogames @ git+https://github.com/metta-ai/cogames.git',
-]
-
-cogames = [
-    'gym',
-    'gymnasium',
-    'omegaconf',
-    'hydra-core',
-    'duckdb',
-    'raylib>=5.5.0',
-    'mettagrid @ git+https://github.com/metta-ai/mettagrid.git',
-    'cogames @ git+https://github.com/metta-ai/cogames.git',
-]
-
-microrts = [
-    'gym==0.23',
-    'gymnasium==0.29.1',
-    'ffmpeg==1.4',
-    'gym_microrts==0.3.2',
-]
-
-minerl = [
-    'gym==0.17.0',
-    'gymnasium==0.29.1',
-    #'git+https://github.com/minerllabs/minerl'
-    # Compatiblity warning with urllib3 and chardet
-    #'requests==2.31.0',
-]
-
 minigrid = [
-    'gym==0.23',
-    'gymnasium==0.29.1',
+    'gymnasium>=1.2.2',
     'minigrid==2.3.1',
 ]
 
-minihack =  [
-    'gym==0.23',
-    'gymnasium==0.29.1',
-    'minihack==0.1.5',
-]
-
 mujoco = [
-    'gymnasium[mujoco]==1.0.0',
+    'gymnasium[mujoco]>=1.2.2',
     'moviepy',
 ]
 
-nethack = [
-    'gym==0.23',
-    'gymnasium==0.29.1',
-    'nle==0.9.1',
-]
-
-nmmo = [
-    'gym==0.23',
-    'gymnasium==0.29.1',
-    'pettingzoo==1.24.1',
-    'nmmo>=2.1',
-]
-
 open_spiel = [
-    'gym==0.23',
-    'gymnasium==0.29.1',
-    'pettingzoo==1.19.0',
+    'gymnasium>=1.2.2',
+    'pettingzoo>=1.24.1',
     'open_spiel==1.3',
 ]
 
 pokemon_red = [
-    'gym==0.23',
-    'gymnasium==0.29.1',
+    'gymnasium>=1.2.2',
     'pokegym>=0.2.0',
     'einops==0.6.1',
     'matplotlib',
@@ -199,14 +98,6 @@ pokemon_red = [
     'websockets',
 ]
 
-procgen = [
-    'gym==0.23',
-    'gymnasium==0.29.1',
-    'stable_baselines3==2.1.0',
-    'procgen-mirror==0.10.7', # Procgen mirror for 3.11 and 3.12 support
-    # Note: You need glfw==2.7 after installing for some torch versions
-]
-
 #'smac': [
 #    'git+https://github.com/oxwhirl/smac.git',
 #],
@@ -214,32 +105,18 @@ procgen = [
 #    'git+https://github.com/Farama-Foundation/stable-retro.git',
 #]
 
-slimevolley = [
-    'gym==0.23',
-    'gymnasium==0.29.1',
-    'slimevolley==0.1.0',
-]
-
 vizdoom = [
-    'gym==0.23',
-    'gymnasium==0.29.1',
+    'gymnasium>=1.2.2',
     'vizdoom==1.2.3',
-    'stable_baselines3==2.1.0',
+    'stable_baselines3==2.7.1',
 ]
 
 ray = [
     'ray==2.23.0',
 ]
 
-tribal-village = [
-    'gym==0.23',
-    'gymnasium==0.29.1',
-    'numpy<2.0',
-    'tribal-village @ git+https://github.com/Metta-AI/tribal-village.git@main',
-]
-
 cleanrl = [
-    'stable_baselines3==2.1.0',
+    'stable_baselines3==2.7.1',
     'tensorboard==2.11.2',
     'tyro==0.8.6',
 ]
@@ -251,11 +128,23 @@ puffer = "pufferlib.pufferl:main"
 Homepage = "https://puffer.ai"
 
 [build-system]
-requires = ["setuptools", "wheel", "Cython", "numpy<2.0", "torch"]
+requires = ["setuptools", "wheel", "Cython", "numpy>=2.0.0,<3.0.0", "torch"]
 build-backend = "setuptools.build_meta"
 
 [tool.uv]
 no-build-isolation-package = ["torch"]
+conflicts = [
+    # Many environment extras have incompatible transitive dependency pins
+    # (e.g., different pygame / nle versions). Declare them as mutually exclusive
+    # so `uv lock` / `uv sync` can still succeed.
+    [
+        { extra = "magent" },
+        { extra = "butterfly" },
+        { extra = "box2d" },
+        { extra = "minigrid" },
+        { extra = "vizdoom" },
+    ],
+]
 
 [tool.setuptools]
 license-files = ["LICENSE"]

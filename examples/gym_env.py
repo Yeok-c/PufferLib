@@ -1,20 +1,19 @@
-import gym
+import gymnasium
 import pufferlib.emulation
 
-class SampleGymEnv(gym.Env):
+class SampleGymnasiumEnv(gymnasium.Env):
     def __init__(self):
-        self.observation_space = gym.spaces.Box(low=-1, high=1, shape=(1,))
-        self.action_space = gym.spaces.Discrete(2)
+        self.observation_space = gymnasium.spaces.Box(low=-1, high=1, shape=(1,))
+        self.action_space = gymnasium.spaces.Discrete(2)
 
-    def reset(self):
-        return self.observation_space.sample()
+    def reset(self, seed=None, options=None):
+        return self.observation_space.sample(), {}
 
     def step(self, action):
-        return self.observation_space.sample(), 0.0, False, {}
+        return self.observation_space.sample(), 0.0, False, False, {}
 
 if __name__ == '__main__':
-    gym_env = SampleGymEnv()
-    gymnasium_env = pufferlib.GymToGymnasium(gym_env)
+    gymnasium_env = SampleGymnasiumEnv()
     puffer_env = pufferlib.emulation.GymnasiumPufferEnv(gymnasium_env)
     observations, info = puffer_env.reset()
     action = puffer_env.action_space.sample()
