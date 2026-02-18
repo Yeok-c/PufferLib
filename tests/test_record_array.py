@@ -1,65 +1,38 @@
 import gymnasium as gym
 import numpy as np
 
-# Create a custom Gym space using Dict, Tuple, and Box
-space = gym.spaces.Dict({
-    "position": gym.spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32),
-    "velocity": gym.spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32),
-    "description": gym.spaces.Tuple((
-        #gym.spaces.Discrete(10),
-        gym.spaces.Box(low=0, high=100, shape=(), dtype=np.int32),
-        gym.spaces.Box(low=0, high=100, shape=(), dtype=np.int32)
-    ))
-})
 
-space = gym.spaces.Dict({
-    "position": gym.spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32),
-})
-
-
-# Define a function to create a dtype from the Gym space
-def create_dtype_from_space(space):
+def create_dtype_from_space(space) -> np.dtype:
+    """Create a structured dtype that matches a Gymnasium space."""
     if isinstance(space, gym.spaces.Dict):
         dtype_fields = [(name, create_dtype_from_space(subspace)) for name, subspace in space.spaces.items()]
         return np.dtype(dtype_fields)
-    elif isinstance(space, gym.spaces.Tuple):
-        dtype_fields = [('field' + str(i), create_dtype_from_space(subspace)) for i, subspace in enumerate(space.spaces)]
+    if isinstance(space, gym.spaces.Tuple):
+        dtype_fields = [(f"field{i}", create_dtype_from_space(subspace)) for i, subspace in enumerate(space.spaces)]
         return np.dtype(dtype_fields)
-    elif isinstance(space, gym.spaces.Box):
-        return (space.dtype, space.shape)
-    elif isinstance(space, gym.spaces.Discrete):
-        return np.int64  # Assuming np.int64 for Discrete spaces
+    if isinstance(space, gym.spaces.Box):
+        # Represent Box as a fixed-shape array field
+        return np.dtype((space.dtype, space.shape))
+    if isinstance(space, gym.spaces.Discrete):
+        return np.dtype(np.int64)
+    raise TypeError(f"Unsupported space type: {type(space)}")
 
-# Compute the dtype from the space
-space_dtype = create_dtype_from_space(space)
 
-sample = dict(space.sample())
-breakpoint()
-np.rec.array(sample, dtype=space_dtype)
+def test_record_array_roundtrip():
+    space = gym.spaces.Dict(
+        {
+            "position": gym.spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32),
+            "velocity": gym.spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32),
+        }
+    )
 
-# Function to sample from the space and convert to a structured numpy array
-def sample_and_convert(space, dtype):
+    dtype = create_dtype_from_space(space)
     sample = space.sample()
-    flat_sample = {}
-    def flatten(sample, name_prefix=""):
-        for key, item in sample.items():
-            full_key = name_prefix + key if name_prefix == "" else name_prefix + "_" + key
-            if isinstance(item, dict):
-                flatten(item, full_key)
-            else:
-                flat_sample[full_key] = item
-    flatten(sample)
-    return np.array(tuple(flat_sample.values()), dtype=dtype)
 
-num_samples = 3
-samples = [sample_and_convert(space, space_dtype) for _ in range(num_samples)]
-print("Samples:", samples)
+    arr = np.zeros((), dtype=dtype)
+    arr["position"] = sample["position"]
+    arr["velocity"] = sample["velocity"]
 
-record_array = np.rec.array(samples)
-print("Record Array:", record_array)
-
-bytes_array = record_array.tobytes()
-print("Bytes Array:", bytes_array)
-
-record_array = np.rec.array(bytes_array, dtype=space_dtype)
-print("Record Array from Bytes:", record_array)
+    # Basic sanity checks: fields present and values preserved
+    assert np.allclose(arr["position"], sample["position"])
+    assert np.allclose(arr["velocity"], sample["velocity"])

@@ -2,7 +2,7 @@ from pdb import set_trace as T
 
 import numpy as np
 import timeit
-import gym
+import gymnasium as gym
 
 from pufferlib.emulation import flatten_structure, flatten_space, flatten, unflatten, concatenate, split
 import pufferlib.utils

@@ -10,14 +10,23 @@ import os
 import sys
 import glob
 import ast
+import csv
+import json
 import time
 import random
+import traceback
 import shutil
+import socket
+import subprocess
+import platform
 import argparse
 import importlib
 import configparser
+from numbers import Number
 from threading import Thread
 from collections import defaultdict, deque
+from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import psutil
@@ -31,6 +40,7 @@ import pufferlib
 import pufferlib.sweep
 import pufferlib.vector
 import pufferlib.pytorch
+import pufferlib.spaces
 try:
     from pufferlib import _C
 except ImportError:
@@ -53,6 +63,33 @@ from torch.utils.cpp_extension import (
 # Assume advantage kernel has been built if torch has been compiled with CUDA or HIP support
 # and can find CUDA or HIP in the system
 ADVANTAGE_CUDA = bool(CUDA_HOME or ROCM_HOME)
+
+@dataclass
+class TrainerLogSnapshot:
+    """Typed trainer metrics + dynamic env metrics."""
+    sps: float
+    agent_steps: int
+    uptime: float
+    epoch: int
+    learning_rate: float
+    environment: dict[str, Any]
+    losses: dict[str, Any]
+    performance: dict[str, Any]
+    system: dict[str, Any]
+
+    def to_logs(self):
+        logs = {
+            'SPS': self.sps,
+            'agent_steps': self.agent_steps,
+            'uptime': self.uptime,
+            'epoch': self.epoch,
+            'learning_rate': self.learning_rate,
+        }
+        logs.update({f'environment/{k}': v for k, v in self.environment.items()})
+        logs.update({f'losses/{k}': v for k, v in self.losses.items()})
+        logs.update({f'performance/{k}': v for k, v in self.performance.items()})
+        logs.update({f'system/{k}': v for k, v in self.system.items()})
+        return logs
 
 class PuffeRL:
     def __init__(self, config, vecenv, policy, logger=None):
@@ -226,6 +263,31 @@ class PuffeRL:
 
         return (self.global_step - self.last_log_step) / (time.time() - self.last_log_time)
 
+    def _sample_random_actions(self, batch_size, device):
+        atn_space = self.vecenv.single_action_space
+        if isinstance(atn_space, pufferlib.spaces.Discrete):
+            action = torch.randint(
+                low=0,
+                high=atn_space.n,
+                size=(batch_size, *atn_space.shape),
+                device=device,
+                dtype=self.actions.dtype,
+            )
+        elif isinstance(atn_space, pufferlib.spaces.MultiDiscrete):
+            nvec = torch.as_tensor(atn_space.nvec, device=device)
+            action = torch.floor(torch.rand(batch_size, len(atn_space.nvec), device=device) * nvec).to(self.actions.dtype)
+        elif isinstance(atn_space, pufferlib.spaces.Box):
+            low = torch.as_tensor(atn_space.low, device=device, dtype=torch.float32)
+            high = torch.as_tensor(atn_space.high, device=device, dtype=torch.float32)
+            action = low + (high - low) * torch.rand((batch_size, *atn_space.shape), device=device)
+            action = action.to(self.actions.dtype)
+        else:
+            raise pufferlib.APIUsageError(f'Unsupported action space for NoPolicy: {atn_space}')
+
+        logprob = torch.zeros(batch_size, device=device)
+        value = torch.zeros(batch_size, device=device)
+        return action, logprob, value
+
     def evaluate(self):
         profile = self.profile
         epoch = self.epoch
@@ -270,8 +332,11 @@ class PuffeRL:
                     state['lstm_h'] = self.lstm_h[env_id.start]
                     state['lstm_c'] = self.lstm_c[env_id.start]
 
-                logits, value = self.policy.forward_eval(o_device, state)
-                action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
+                if getattr(self.policy, 'is_no_policy', False):
+                    action, logprob, value = self._sample_random_actions(o_device.shape[0], device)
+                else:
+                    logits, value = self.policy.forward_eval(o_device, state)
+                    action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
                 r = torch.clamp(r, -1, 1)
 
             profile('eval_copy', epoch)
@@ -280,9 +345,21 @@ class PuffeRL:
                     self.lstm_h[env_id.start] = state['lstm_h']
                     self.lstm_c[env_id.start] = state['lstm_c']
 
-                # Fast path for fully vectorized envs
-                l = self.ep_lengths[env_id.start].item()
-                batch_rows = slice(self.ep_indices[env_id.start].item(), 1+self.ep_indices[env_id.stop - 1].item())
+                # Fast path for fully vectorized envs. Some vector backends report
+                # env indices while returning batched agent rows (agents_per_batch > 1).
+                # Derive the effective agent-row span from the returned tensor shape.
+                env_count = max(1, env_id.stop - env_id.start)
+                batch_count = int(o_device.shape[0])
+                agents_per_batch = getattr(self.vecenv, 'agents_per_batch', None)
+                if agents_per_batch is None or agents_per_batch * env_count != batch_count:
+                    agents_per_batch = max(1, batch_count // env_count)
+
+                agent_start = env_id.start * agents_per_batch
+                agent_stop = agent_start + batch_count
+                agent_id = slice(agent_start, agent_stop)
+
+                l = self.ep_lengths[agent_id.start].item()
+                batch_rows = slice(self.ep_indices[agent_id.start].item(), 1+self.ep_indices[agent_id.stop - 1].item())
 
                 if config['cpu_offload']:
                     self.observations[batch_rows, l] = o
@@ -305,7 +382,7 @@ class PuffeRL:
                     self.full_rows += num_full
 
                 action = action.cpu().numpy()
-                if isinstance(logits, torch.distributions.Normal):
+                if isinstance(self.vecenv.single_action_space, pufferlib.spaces.Box):
                     action = np.clip(action, self.vecenv.action_space.low, self.vecenv.action_space.high)
 
             profile('eval_misc', epoch)
@@ -337,6 +414,35 @@ class PuffeRL:
         losses = defaultdict(float)
         config = self.config
         device = config['device']
+
+        if getattr(self.policy, 'is_no_policy', False):
+            self.losses = {
+                'policy_loss': 0.0,
+                'value_loss': 0.0,
+                'entropy': 0.0,
+                'old_approx_kl': 0.0,
+                'approx_kl': 0.0,
+                'clipfrac': 0.0,
+                'importance': 1.0,
+                'explained_variance': 0.0,
+            }
+            profile.end()
+            logs = None
+            self.epoch += 1
+            done_training = self.global_step >= config['total_timesteps']
+            if done_training or self.global_step == 0 or time.time() > self.last_log_time + 0.25:
+                logs = self.mean_and_log()
+                self.print_dashboard()
+                self.stats = defaultdict(list)
+                self.last_log_time = time.time()
+                self.last_log_step = self.global_step
+                profile.clear()
+
+            if self.epoch % config['checkpoint_interval'] == 0 or done_training:
+                self.save_checkpoint()
+                self.msg = f'Checkpoint saved at update {self.epoch}'
+
+            return logs
 
         b0 = config['prio_beta0']
         a = config['prio_alpha']
@@ -488,19 +594,21 @@ class PuffeRL:
 
         device = config['device']
         agent_steps = int(dist_sum(self.global_step, device))
-        logs = {
-            'SPS': dist_sum(self.sps, device),
-            'agent_steps': agent_steps,
-            'uptime': time.time() - self.start_time,
-            'epoch': int(dist_sum(self.epoch, device)),
-            'learning_rate': self.optimizer.param_groups[0]["lr"],
-            **{f'environment/{k}': v for k, v in self.stats.items()},
-            **{f'losses/{k}': v for k, v in self.losses.items()},
-            **{f'performance/{k}': v['elapsed'] for k, v in self.profile},
-            #**{f'environment/{k}': dist_mean(v, device) for k, v in self.stats.items()},
-            #**{f'losses/{k}': dist_mean(v, device) for k, v in self.losses.items()},
-            #**{f'performance/{k}': dist_sum(v['elapsed'], device) for k, v in self.profile},
-        }
+        snapshot = TrainerLogSnapshot(
+            sps=dist_sum(self.sps, device),
+            agent_steps=agent_steps,
+            uptime=time.time() - self.start_time,
+            epoch=int(dist_sum(self.epoch, device)),
+            learning_rate=self.optimizer.param_groups[0]["lr"],
+            environment=dict(self.stats),
+            losses=dict(self.losses),
+            performance={k: v['elapsed'] for k, v in self.profile},
+            system=self.utilization.snapshot_metrics(),
+            # environment={k: dist_mean(v, device) for k, v in self.stats.items()},
+            # losses={k: dist_mean(v, device) for k, v in self.losses.items()},
+            # performance={k: dist_sum(v['elapsed'], device) for k, v in self.profile},
+        )
+        logs = snapshot.to_logs()
 
         if torch.distributed.is_initialized():
            if torch.distributed.get_rank() != 0:
@@ -517,7 +625,10 @@ class PuffeRL:
         self.utilization.stop()
         model_path = self.save_checkpoint()
         run_id = self.logger.run_id
-        path = os.path.join(self.config['data_dir'], f'{self.config["env"]}_{run_id}.pt')
+        log_dir = self.config.get('log_dir', self.config.get('data_dir', 'experiments'))
+        checkpoint_dir = os.path.join(log_dir, 'checkpoints')
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        path = os.path.join(checkpoint_dir, f'{self.config["env"]}_{run_id}.pt')
         shutil.copy(model_path, path)
         return path
 
@@ -527,7 +638,9 @@ class PuffeRL:
                return
  
         run_id = self.logger.run_id
-        path = os.path.join(self.config['data_dir'], f'{self.config["env"]}_{run_id}')
+        log_dir = self.config.get('log_dir', self.config.get('data_dir', 'experiments'))
+        checkpoint_dir = os.path.join(log_dir, 'checkpoints')
+        path = os.path.join(checkpoint_dir, f'{self.config["env"]}_{run_id}')
         if not os.path.exists(path):
             os.makedirs(path)
 
@@ -772,34 +885,133 @@ class Utilization(Thread):
         super().__init__()
         self.cpu_mem = deque([0], maxlen=maxlen)
         self.cpu_util = deque([0], maxlen=maxlen)
+        self.cpu_core_util = deque([[]], maxlen=maxlen)
+        self.cpu_power_watts = deque([float('nan')], maxlen=maxlen)
+        self.ram_used_bytes = deque([0], maxlen=maxlen)
+        self.ram_total_bytes = deque([0], maxlen=maxlen)
         self.gpu_util = deque([0], maxlen=maxlen)
         self.gpu_mem = deque([0], maxlen=maxlen)
+        self.gpu_power_watts = deque([float('nan')], maxlen=maxlen)
+        self.vram_used_bytes = deque([0], maxlen=maxlen)
+        self.vram_total_bytes = deque([0], maxlen=maxlen)
         self.stopped = False
         self.delay = delay
+        self._rapl_paths = glob.glob('/sys/class/powercap/intel-rapl:*/energy_uj')
+        self._last_cpu_energy_uj = None
+        self._last_cpu_energy_ts = None
+        self._nvidia_smi_available = None
         self.start()
+
+    def _mean_valid(self, values, default=float('nan')):
+        vals = [v for v in values if not (isinstance(v, float) and np.isnan(v))]
+        if not vals:
+            return default
+        return float(np.mean(vals))
+
+    def _read_cpu_power_watts(self):
+        if len(self._rapl_paths) == 0:
+            return float('nan')
+
+        try:
+            energy_uj = 0
+            for path in self._rapl_paths:
+                with open(path) as f:
+                    energy_uj += int(f.read().strip())
+
+            now = time.time()
+            if self._last_cpu_energy_uj is None or self._last_cpu_energy_ts is None:
+                self._last_cpu_energy_uj = energy_uj
+                self._last_cpu_energy_ts = now
+                return float('nan')
+
+            delta_uj = energy_uj - self._last_cpu_energy_uj
+            delta_t = now - self._last_cpu_energy_ts
+            self._last_cpu_energy_uj = energy_uj
+            self._last_cpu_energy_ts = now
+            if delta_uj <= 0 or delta_t <= 0:
+                return float('nan')
+            return (delta_uj / 1e6) / delta_t
+        except Exception:
+            return float('nan')
+
+    def _read_gpu_power_watts(self):
+        if self._nvidia_smi_available is False:
+            return float('nan')
+
+        try:
+            out = subprocess.check_output(
+                ['nvidia-smi', '--query-gpu=power.draw', '--format=csv,noheader,nounits'],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip().splitlines()
+            self._nvidia_smi_available = True
+            if len(out) == 0:
+                return float('nan')
+            return float(out[0].split(',')[0].strip())
+        except Exception:
+            self._nvidia_smi_available = False
+            return float('nan')
 
     def run(self):
         while not self.stopped:
-            self.cpu_util.append(100*psutil.cpu_percent()/psutil.cpu_count())
+            per_core = psutil.cpu_percent(percpu=True)
+            self.cpu_core_util.append(per_core)
+            if len(per_core) > 0:
+                self.cpu_util.append(float(np.mean(per_core)))
+            else:
+                self.cpu_util.append(100*psutil.cpu_percent()/psutil.cpu_count())
+
             mem = psutil.virtual_memory()
             self.cpu_mem.append(100*mem.active/mem.total)
+            self.ram_used_bytes.append(mem.active)
+            self.ram_total_bytes.append(mem.total)
+            self.cpu_power_watts.append(self._read_cpu_power_watts())
             if torch.cuda.is_available():
                 # Monitoring in distributed crashes nvml
                 if torch.distributed.is_initialized():
+                   self.gpu_util.append(float('nan'))
+                   self.gpu_mem.append(float('nan'))
+                   self.gpu_power_watts.append(float('nan'))
+                   self.vram_used_bytes.append(0)
+                   self.vram_total_bytes.append(0)
                    time.sleep(self.delay)
                    continue
 
                 self.gpu_util.append(torch.cuda.utilization())
                 free, total = torch.cuda.mem_get_info()
                 self.gpu_mem.append(100*(total-free)/total)
+                self.vram_used_bytes.append(total - free)
+                self.vram_total_bytes.append(total)
+                self.gpu_power_watts.append(self._read_gpu_power_watts())
             else:
-                self.gpu_util.append(0)
-                self.gpu_mem.append(0)
+                self.gpu_util.append(float('nan'))
+                self.gpu_mem.append(float('nan'))
+                self.gpu_power_watts.append(float('nan'))
+                self.vram_used_bytes.append(0)
+                self.vram_total_bytes.append(0)
 
             time.sleep(self.delay)
 
     def stop(self):
         self.stopped = True
+
+    def snapshot_metrics(self):
+        per_core = self.cpu_core_util[-1] if len(self.cpu_core_util) > 0 else []
+        core_metrics = {f'cpu_core_{i}_pct': value for i, value in enumerate(per_core)}
+        metrics = {
+            'cpu_pct': self._mean_valid(self.cpu_util, 0.0),
+            'ram_pct': self._mean_valid(self.cpu_mem, 0.0),
+            'gpu_pct': self._mean_valid(self.gpu_util),
+            'vram_pct': self._mean_valid(self.gpu_mem),
+            'cpu_power_watts': self._mean_valid(self.cpu_power_watts),
+            'gpu_power_watts': self._mean_valid(self.gpu_power_watts),
+            'ram_used_bytes': int(self.ram_used_bytes[-1]),
+            'ram_total_bytes': int(self.ram_total_bytes[-1]),
+            'vram_used_bytes': int(self.vram_used_bytes[-1]),
+            'vram_total_bytes': int(self.vram_total_bytes[-1]),
+            **core_metrics,
+        }
+        return metrics
 
 def downsample(data_list, num_points):
     if not data_list or num_points <= 0:
@@ -830,6 +1042,469 @@ class NoLogger:
 
     def close(self, model_path, early_stop):
         pass
+
+class CsvLogger:
+    def __init__(self, args, env_name=None, policy=None, vecenv=None):
+        self.run_id = str(int(100*time.time()))
+        self.env_name = env_name
+        self.policy = policy
+        self.vecenv = vecenv
+        csv_dir = args.get('log_dir')
+        if csv_dir is None:
+            raise pufferlib.APIUsageError('log_dir is required when using CsvLogger')
+
+        if os.path.exists(csv_dir) and not os.path.isdir(csv_dir):
+            raise pufferlib.APIUsageError(
+                f'log_dir must point to a directory, but found a file: {csv_dir}'
+            )
+
+        os.makedirs(csv_dir, exist_ok=True)
+
+        self.path = os.path.join(csv_dir, 'logs.csv')
+        self.schema_path = os.path.join(csv_dir, 'schema.csv')
+        self.columns = []
+        self.field_types = {}
+        self.file = open(self.path, 'a+', newline='')
+        self.file.seek(0)
+        self._load_existing_header()
+        self._write_schema()
+
+        self._write_experiment_info_csv(csv_dir)
+
+    def _machine_info(self):
+        cpu_freq = float('nan')
+        try:
+            psutil_freq = psutil.cpu_freq()
+            if psutil_freq is not None and psutil_freq.current is not None:
+                cpu_freq = float(psutil_freq.current) * 1_000_000.0
+        except Exception:
+            pass
+
+        # CPU package power is not exposed consistently across platforms via psutil.
+        cpu_total_power_watts = float('nan')
+        cpu_model_name = self._cpu_model_name()
+        cpu_governor_or_power_mode = self._cpu_governor_or_power_mode()
+
+        gpu_name = ''
+        gpu_total_watts = float('nan')
+        gpu_driver_version = ''
+        gpu_clock_graphics_mhz = float('nan')
+        gpu_clock_mem_mhz = float('nan')
+        nvidia_fields = self._nvidia_smi_fields()
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+            gpu_total_watts = nvidia_fields.get('power.limit', float('nan'))
+            gpu_driver_version = nvidia_fields.get('driver_version', '')
+            gpu_clock_graphics_mhz = nvidia_fields.get('clocks.gr', float('nan'))
+            gpu_clock_mem_mhz = nvidia_fields.get('clocks.mem', float('nan'))
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            gpu_name = 'Apple Metal (MPS)'
+
+        cuda_runtime_version = torch.version.cuda if torch.version.cuda is not None else ''
+        cudnn_version = torch.backends.cudnn.version()
+        if cudnn_version is None:
+            cudnn_version = ''
+
+        info = {
+            'run_id': self.run_id,
+            'env': self.env_name if self.env_name is not None else '',
+            'timestamp': time.time(),
+            'hostname': socket.gethostname(),
+            'platform': platform.platform(),
+            'system': platform.system(),
+            'release': platform.release(),
+            'machine': platform.machine(),
+            'processor': platform.processor(),
+            'git_commit': self._git_commit(),
+            'torch_version': torch.__version__,
+            'torch_build_cuda': torch.version.cuda if torch.version.cuda is not None else '',
+            'cuda_runtime_version': cuda_runtime_version,
+            'cudnn_version': cudnn_version,
+            'pufferlib_version': getattr(pufferlib, '__version__', ''),
+            'python_version': platform.python_version(),
+            'cpu_model_name': cpu_model_name,
+            'cpu_count_logical': psutil.cpu_count(logical=True),
+            'cpu_count_physical': psutil.cpu_count(logical=False),
+            'cpu_freq': cpu_freq,
+            'cpu_governor_or_power_mode': cpu_governor_or_power_mode,
+            'cpu_total_power_watts': cpu_total_power_watts,
+            'memory_total_bytes': psutil.virtual_memory().total,
+            'ram_speed': float('nan'),
+            'swap_enabled': psutil.swap_memory().total > 0,
+            'thermal_state': self._thermal_state(),
+            'is_thermal_throttled': self._is_thermal_throttled(),
+            'gpu_name': gpu_name,
+            'gpu_total_watts': gpu_total_watts,
+            'gpu_power_limit_watts': gpu_total_watts,
+            'gpu_driver_version': gpu_driver_version,
+            'gpu_clock_graphics_mhz': gpu_clock_graphics_mhz,
+            'gpu_clock_mem_mhz': gpu_clock_mem_mhz,
+            'cuda_available': torch.cuda.is_available(),
+            'cuda_device_count': torch.cuda.device_count() if torch.cuda.is_available() else 0,
+        }
+        if torch.cuda.is_available():
+            info['cuda_device_name_0'] = torch.cuda.get_device_name(0)
+            free, total = torch.cuda.mem_get_info()
+            info['cuda_vram_total_bytes_0'] = total
+            info['cuda_vram_free_bytes_0'] = free
+            info['cuda_power_limit_watts_0'] = self._gpu_power_limit_watts()
+        return info
+
+    def _model_info(self):
+        if self.policy is None:
+            return {
+                'model_param_count_total': float('nan'),
+                'model_param_count_trainable': float('nan'),
+                'model_param_size_bytes': float('nan'),
+                'model_param_size_mib': float('nan'),
+            }
+
+        total_params = 0
+        trainable_params = 0
+        param_size_bytes = 0
+        for param in self.policy.parameters():
+            count = int(param.numel())
+            total_params += count
+            if param.requires_grad:
+                trainable_params += count
+            param_size_bytes += count * int(param.element_size())
+
+        return {
+            'model_param_count_total': total_params,
+            'model_param_count_trainable': trainable_params,
+            'model_param_size_bytes': param_size_bytes,
+            'model_param_size_mib': float(param_size_bytes / (1024 * 1024)),
+        }
+
+    def _experiment_info(self):
+        info = self._machine_info()
+        info.update(self._model_info())
+        info.update(self._spaces_and_arch_info())
+        return info
+
+    def _spaces_and_arch_info(self):
+        obs_space = None
+        action_space = None
+        if self.vecenv is not None:
+            obs_space = getattr(self.vecenv, 'single_observation_space', None)
+            action_space = getattr(self.vecenv, 'single_action_space', None)
+
+        return {
+            'observation_space': self._space_to_string(obs_space),
+            'action_space': self._space_to_string(action_space),
+            'neural_network_final_layer_size': self._infer_final_layer_size(),
+        }
+
+    def _space_to_string(self, space):
+        if space is None:
+            return ''
+        return str(space)
+
+    def _infer_final_layer_size(self):
+        if self.policy is None:
+            return float('nan')
+
+        # Use the last trainable layer with explicit output size if possible.
+        for module in reversed(list(self.policy.modules())):
+            out_features = getattr(module, 'out_features', None)
+            if out_features is not None:
+                return int(out_features)
+
+            out_channels = getattr(module, 'out_channels', None)
+            if out_channels is not None:
+                return int(out_channels)
+
+        return float('nan')
+
+    def _gpu_power_limit_watts(self):
+        try:
+            out = subprocess.check_output(
+                ['nvidia-smi', '--query-gpu=power.limit', '--format=csv,noheader,nounits'],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip().splitlines()
+            if len(out) == 0:
+                return float('nan')
+            return float(out[0].split(',')[0].strip())
+        except Exception:
+            return float('nan')
+
+    def _nvidia_smi_fields(self):
+        keys = ['driver_version', 'power.limit', 'clocks.gr', 'clocks.mem']
+        result = {
+            'driver_version': '',
+            'power.limit': float('nan'),
+            'clocks.gr': float('nan'),
+            'clocks.mem': float('nan'),
+        }
+        try:
+            out = subprocess.check_output(
+                ['nvidia-smi', f'--query-gpu={",".join(keys)}', '--format=csv,noheader,nounits'],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip().splitlines()
+            if len(out) == 0:
+                return result
+
+            values = [v.strip() for v in out[0].split(',')]
+            if len(values) != len(keys):
+                return result
+
+            result['driver_version'] = values[0]
+            result['power.limit'] = float(values[1])
+            result['clocks.gr'] = float(values[2])
+            result['clocks.mem'] = float(values[3])
+            return result
+        except Exception:
+            return result
+
+    def _git_commit(self):
+        try:
+            return subprocess.check_output(
+                ['git', 'rev-parse', 'HEAD'],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip()
+        except Exception:
+            return ''
+
+    def _cpu_model_name(self):
+        try:
+            if platform.system() == 'Darwin':
+                return subprocess.check_output(
+                    ['sysctl', '-n', 'machdep.cpu.brand_string'],
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                ).strip()
+            if platform.system() == 'Linux':
+                with open('/proc/cpuinfo') as cpuinfo:
+                    for line in cpuinfo:
+                        if 'model name' in line:
+                            return line.split(':', 1)[1].strip()
+        except Exception:
+            pass
+        return platform.processor()
+
+    def _cpu_governor_or_power_mode(self):
+        try:
+            if platform.system() == 'Linux':
+                path = '/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor'
+                if os.path.exists(path):
+                    with open(path) as f:
+                        return f.read().strip()
+            if platform.system() == 'Darwin':
+                out = subprocess.check_output(
+                    ['pmset', '-g', 'custom'],
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                ).strip()
+                if out:
+                    return out
+        except Exception:
+            pass
+        return ''
+
+    def _thermal_state(self):
+        try:
+            if platform.system() == 'Darwin':
+                out = subprocess.check_output(
+                    ['pmset', '-g', 'therm'],
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                ).strip()
+                if out:
+                    return out
+        except Exception:
+            pass
+        return ''
+
+    def _is_thermal_throttled(self):
+        therm = self._thermal_state().lower()
+        return 'throttle' in therm
+
+    def _write_experiment_info_csv(self, csv_dir):
+        info_path = os.path.join(csv_dir, 'experiment_info.csv')
+        experiment_info = self._experiment_info()
+        with open(info_path, 'w', newline='') as info_file:
+            writer = csv.writer(info_file)
+            writer.writerow(['key', 'value'])
+            for key, value in experiment_info.items():
+                writer.writerow([key, self._serialize_value(value)])
+
+    def _load_existing_header(self):
+        self.file.seek(0)
+        header = self.file.readline().strip()
+        if header:
+            self.columns = next(csv.reader([header]))
+            if self.columns == ['step', 'metric', 'value', 'wall_time']:
+                raise pufferlib.APIUsageError(
+                    f'{self.path} uses the old long CSV format. '
+                    'Please use a new log_dir (or remove the file) for wide per-step rows.'
+                )
+            if 'step' not in self.columns or 'wall_time' not in self.columns:
+                raise pufferlib.APIUsageError(
+                    f'Unexpected CSV header in {self.path}. Expected "step" and "wall_time" columns.'
+                )
+        else:
+            self.columns = ['run_id', 'step', 'wall_time']
+            self.file.seek(0)
+            writer = csv.writer(self.file)
+            writer.writerow(self.columns)
+            self.file.flush()
+            self._write_schema()
+
+    def _infer_type(self, value):
+        if isinstance(value, np.generic):
+            value = value.item()
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 1:
+                value = value.item()
+            else:
+                return 'json'
+        if isinstance(value, bool):
+            return 'bool'
+        if isinstance(value, int):
+            return 'int'
+        if isinstance(value, float):
+            return 'float'
+        if isinstance(value, str):
+            return 'str'
+        return 'json'
+
+    def _write_schema(self):
+        existing_rows = {}
+        if os.path.exists(self.schema_path):
+            with open(self.schema_path, newline='') as schema_file:
+                reader = csv.DictReader(schema_file)
+                for row in reader:
+                    existing_rows[row['field']] = row
+
+        with open(self.schema_path, 'w', newline='') as schema_file:
+            writer = csv.writer(schema_file)
+            writer.writerow(['field', 'type', 'format', 'source'])
+            for field in self.columns:
+                row = existing_rows.get(field, {})
+                dtype = row.get('type') or self.field_types.get(field, 'str')
+                fmt = row.get('format') or ('{:.4e}' if dtype in ('float', 'int') else 'raw')
+                source = row.get('source') or ('system' if field in ('run_id', 'step', 'wall_time') else 'trainer')
+                writer.writerow([field, dtype, fmt, source])
+
+    def _rewrite_csv_with_new_columns(self, new_columns):
+        self.file.seek(0)
+        rows = []
+        reader = csv.DictReader(self.file)
+        for row in reader:
+            rows.append(row)
+
+        self.file.close()
+        self.file = open(self.path, 'w+', newline='')
+        writer = csv.DictWriter(self.file, fieldnames=new_columns)
+        writer.writeheader()
+        for row in rows:
+            out = {field: row.get(field, '') for field in new_columns}
+            writer.writerow(out)
+        self.file.flush()
+        self.columns = new_columns
+        self._write_schema()
+
+    def _ensure_columns(self, logs):
+        missing = [k for k in logs if k not in self.columns]
+        if not missing:
+            return
+
+        for field in missing:
+            self.field_types[field] = self._infer_type(logs[field])
+
+        new_columns = [*self.columns, *missing]
+        self._rewrite_csv_with_new_columns(new_columns)
+
+    def _format_numeric(self, value):
+        if isinstance(value, bool):
+            return str(value)
+        if isinstance(value, Number):
+            return f'{float(value):.4e}'
+        return value
+
+    def _serialize_value(self, value):
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 1:
+                return value.item()
+            return json.dumps(value.detach().cpu().tolist())
+        if isinstance(value, (dict, list, tuple)):
+            return json.dumps(value)
+        return value
+
+    def log(self, logs, step):
+        logs = dict(logs)
+        logs['run_id'] = self.run_id
+        self._ensure_columns(logs)
+        row = {field: '' for field in self.columns}
+        row['run_id'] = self.run_id
+        row['step'] = str(step)
+        row['wall_time'] = self._format_numeric(time.time())
+        for field, value in logs.items():
+            serialized = self._serialize_value(value)
+            row[field] = self._format_numeric(serialized)
+
+        writer = csv.DictWriter(self.file, fieldnames=self.columns)
+        writer.writerow(row)
+        self.file.flush()
+
+    def close(self, model_path, early_stop):
+        if not self.file.closed:
+            self.file.close()
+
+class CompositeLogger:
+    def __init__(self, loggers):
+        if len(loggers) == 0:
+            raise pufferlib.APIUsageError('CompositeLogger requires at least one logger')
+
+        self.loggers = loggers
+        self.run_id = loggers[0].run_id
+
+    def log(self, logs, step):
+        for logger in self.loggers:
+            logger.log(logs, step)
+
+    def close(self, model_path, early_stop):
+        for logger in self.loggers:
+            logger.close(model_path, early_stop)
+
+class TensorboardLogger:
+    def __init__(self, args):
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+        except Exception as exc:
+            raise pufferlib.APIUsageError(
+                'TensorBoard logging requires tensorboard. Install with `pip install tensorboard`.'
+            ) from exc
+
+        self.run_id = str(int(100*time.time()))
+        log_dir = args.get('log_dir')
+        if log_dir is None:
+            raise pufferlib.APIUsageError('log_dir is required when using TensorboardLogger')
+        base_dir = os.path.join(log_dir, 'tensorboard')
+        env_name = args.get('env_name') or args['train'].get('env') or 'run'
+        run_dir = os.path.join(base_dir, f'{env_name}_{self.run_id}')
+        os.makedirs(run_dir, exist_ok=True)
+        self.writer = SummaryWriter(log_dir=run_dir)
+
+    def log(self, logs, step):
+        for key, value in logs.items():
+            if isinstance(value, np.generic):
+                value = value.item()
+            if isinstance(value, bool):
+                self.writer.add_scalar(key, int(value), step)
+            elif isinstance(value, Number):
+                self.writer.add_scalar(key, float(value), step)
+
+    def close(self, model_path, early_stop):
+        self.writer.add_text('run/model_path', str(model_path))
+        self.writer.add_text('run/early_stop', str(early_stop))
+        self.writer.flush()
+        self.writer.close()
 
 class NeptuneLogger:
     def __init__(self, args, load_id=None, mode='async'):
@@ -938,12 +1613,25 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, early_stop
         model.forward_eval = policy.forward_eval
         policy = model.to(local_rank)
 
-    if args['neptune']:
-        logger = NeptuneLogger(args)
-    elif args['wandb']:
-        logger = WandbLogger(args)
+    if logger is None:
+        selected_loggers = []
+        if args.get('log_dir'):
+            selected_loggers.append(
+                CsvLogger(args, env_name=env_name, policy=policy, vecenv=vecenv)
+            )
+        if args['tensorboard']:
+            selected_loggers.append(TensorboardLogger(args))
+        if args['neptune']:
+            selected_loggers.append(NeptuneLogger(args))
+        elif args['wandb']:
+            selected_loggers.append(WandbLogger(args))
 
-    train_config = { **args['train'], 'env': env_name }
+        if len(selected_loggers) == 1:
+            logger = selected_loggers[0]
+        elif len(selected_loggers) > 1:
+            logger = CompositeLogger(selected_loggers)
+
+    train_config = { **args['train'], 'env': env_name, 'log_dir': args.get('log_dir') }
     pufferl = PuffeRL(train_config, vecenv, policy, logger)
 
     # Sweep needs data for early stopped runs, so send data when steps > 100M
@@ -1014,10 +1702,19 @@ def eval(env_name, args=None, vecenv=None, policy=None):
         )
 
     frames = []
+    dropped_frames = 0
     while True:
         render = driver.render()
         if len(frames) < args['save_frames']:
-            frames.append(render)
+            if render is not None:
+                frames.append(render)
+            else:
+                dropped_frames += 1
+                if dropped_frames == 1:
+                    print(
+                        'Warning: render() returned None while collecting GIF frames. '
+                        'Use --render-mode rgb_array for GIF capture.'
+                    )
 
         # Screenshot Ocean envs with F12, gifs with control + F12
         if driver.render_mode == 'ansi':
@@ -1042,18 +1739,27 @@ def eval(env_name, args=None, vecenv=None, policy=None):
 
         ob = vecenv.step(action)[0]
 
+        if args['save_frames'] > 0 and len(frames) == 0 and dropped_frames >= args['save_frames']:
+            vecenv.close()
+            raise pufferlib.APIUsageError(
+                'Unable to save GIF: no renderable frames were produced. '
+                'Try --render-mode rgb_array.'
+            )
+
         if len(frames) > 0 and len(frames) == args['save_frames']:
             import imageio
             imageio.mimsave(args['gif_path'], frames, fps=args['fps'], loop=0)
             print(f'Saved {len(frames)} frames to {args["gif_path"]}')
+            vecenv.close()
+            return
 
 def stop_if_loss_nan(logs):
     return any("losses/" in k and np.isnan(v) for k, v in logs.items())
 
 def sweep(args=None, env_name=None):
     args = args or load_config(env_name)
-    if not args['wandb'] and not args['neptune']:
-        raise pufferlib.APIUsageError('Sweeps require either wandb or neptune')
+    if not args['wandb'] and not args['neptune'] and not args['tensorboard']:
+        raise pufferlib.APIUsageError('Sweeps require at least one logger: wandb, neptune, or tensorboard')
     args['no_model_upload'] = True  # Uploading trained model during sweep crashed wandb
 
     method = args['sweep'].pop('method')
@@ -1064,8 +1770,34 @@ def sweep(args=None, env_name=None):
 
     sweep = sweep_cls(args['sweep'])
     points_per_run = args['sweep']['downsample']
-    target_key = f'environment/{args["sweep"]["metric"]}'
+    metric_name = args['sweep']['metric']
+    # Support both prefixed metrics (e.g. "environment/score"), top-level trainer
+    # metrics (e.g. "SPS"), and shorthand environment metrics (e.g. "score").
+    top_level_metrics = {'SPS', 'agent_steps', 'uptime', 'epoch', 'learning_rate'}
+    top_level_aliases = {'sps': 'SPS'}
+    if '/' in metric_name:
+        target_key = metric_name
+    elif metric_name in top_level_metrics:
+        target_key = metric_name
+    elif metric_name.lower() in top_level_aliases:
+        target_key = top_level_aliases[metric_name.lower()]
+    else:
+        target_key = f'environment/{metric_name}'
     running_target_buffer = deque(maxlen=30)
+
+    def cleanup_failed_run_state():
+        # If training crashes before logger.close(), ensure wandb does not keep
+        # an active run alive and block the next sweep iteration in-process.
+        if args['wandb']:
+            with contextlib.suppress(Exception):
+                import wandb
+                if wandb.run is not None:
+                    wandb.finish(exit_code=1, quiet=True)
+
+        # OOM and driver-side failures can leave fragmented cache behind.
+        if torch.cuda.is_available():
+            with contextlib.suppress(Exception):
+                torch.cuda.empty_cache()
 
     def stop_if_perf_below(logs):
         if stop_if_loss_nan(logs):
@@ -1089,6 +1821,9 @@ def sweep(args=None, env_name=None):
                 return True
         return False
 
+    max_consecutive_failures = 5
+    consecutive_failures = 0
+
     for i in range(args['max_runs']):
         seed = time.time_ns() & 0xFFFFFFFF
         random.seed(seed)
@@ -1099,11 +1834,41 @@ def sweep(args=None, env_name=None):
         if i > 0:
             sweep.suggest(args)
 
-        all_logs = train(env_name, args=args, early_stop_fn=stop_if_perf_below)
+        try:
+            all_logs = train(env_name, args=args, early_stop_fn=stop_if_perf_below)
+        except Exception:
+            # Treat invalid hyperparameter combinations and runtime failures as sweep failures.
+            # This keeps the sweep alive and allows the optimizer to avoid bad regions.
+            cleanup_failed_run_state()
+            warnings.warn(
+                'Sweep run failed; continuing to next suggestion.\n'
+                f'{traceback.format_exc()}',
+                UserWarning,
+                stacklevel=2,
+            )
+            sweep.observe(args, 0, 0, is_failure=True)
+            consecutive_failures += 1
+            if consecutive_failures >= max_consecutive_failures:
+                warnings.warn(
+                    f'Stopping sweep after {consecutive_failures} consecutive failed runs.',
+                    UserWarning,
+                    stacklevel=2,
+                )
+                break
+            continue
+
         all_logs = [e for e in all_logs if target_key in e]
 
         if not all_logs:
             sweep.observe(args, 0, 0, is_failure=True)
+            consecutive_failures += 1
+            if consecutive_failures >= max_consecutive_failures:
+                warnings.warn(
+                    f'Stopping sweep after {consecutive_failures} consecutive failed runs.',
+                    UserWarning,
+                    stacklevel=2,
+                )
+                break
             continue
 
         total_timesteps = args['train']['total_timesteps']
@@ -1118,6 +1883,16 @@ def sweep(args=None, env_name=None):
             c = costs.pop()
             args['train']['total_timesteps'] = timesteps.pop()
             sweep.observe(args, s, c, is_failure=True)
+            consecutive_failures += 1
+            if consecutive_failures >= max_consecutive_failures:
+                warnings.warn(
+                    f'Stopping sweep after {consecutive_failures} consecutive failed runs.',
+                    UserWarning,
+                    stacklevel=2,
+                )
+                break
+        else:
+            consecutive_failures = 0
 
         for score, cost, timestep in zip(scores, costs, timesteps):
             args['train']['total_timesteps'] = timestep
@@ -1174,7 +1949,11 @@ def load_env(env_name, args):
     module_name = 'pufferlib.ocean' if package == 'ocean' else f'pufferlib.environments.{package}'
     env_module = importlib.import_module(module_name)
     make_env = env_module.env_creator(env_name)
-    return pufferlib.vector.make(make_env, env_kwargs=args['env'], **args['vec'])
+    env_kwargs = dict(args['env'])
+    render_mode = args.get('render_mode')
+    if render_mode and render_mode != 'auto':
+        env_kwargs['render_mode'] = None if render_mode == 'None' else render_mode
+    return pufferlib.vector.make(make_env, env_kwargs=env_kwargs, **args['vec'])
 
 def load_policy(args, vecenv, env_name=''):
     package = args['package']
@@ -1271,6 +2050,8 @@ def make_parser():
     parser.add_argument('--neptune', action='store_true', help='Use neptune for logging')
     parser.add_argument('--neptune-name', type=str, default='pufferai')
     parser.add_argument('--neptune-project', type=str, default='ablations')
+    parser.add_argument('--log-dir', type=str, default='experiments', help='Root directory for logs and checkpoints')
+    parser.add_argument('--tensorboard', action='store_true', help='Use TensorBoard for logging')
     parser.add_argument('--no-model-upload', action='store_true', help='Do not upload models to wandb or neptune')
     parser.add_argument('--local-rank', type=int, default=0, help='Used by torchrun for DDP')
     parser.add_argument('--tag', type=str, default=None, help='Tag for experiment')

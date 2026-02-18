@@ -272,10 +272,9 @@ for key, value in cfg_vars.items():
 
 install_requires = [
     'setuptools',
-    'numpy<2.0',
-    'shimmy[gym-v21]',
-    'gym==0.23',
-    'gymnasium>=0.29.1',
+    'numpy>=2.0.0,<2.3.4; python_version == "3.10"',
+    'numpy>=2.3.4,<3.0.0; python_version >= "3.11"',
+    'gymnasium>=1.2.2',
     'pettingzoo>=1.24.1',
 ]
 
@@ -289,7 +288,7 @@ if not NO_TRAIN:
         'imageio',
         'gpytorch',
         'scikit-learn',
-        'heavyball>=2.2.0', # contains relevant fixes compared to 1.7.2 and 2.1.1
+        'heavyball>=2.2.2; python_version >= "3.11"', # numpy>=2.3.4 (Py>=3.11); skip on 3.10
         'neptune',
         'wandb',
     ]

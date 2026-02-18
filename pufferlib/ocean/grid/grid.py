@@ -7,9 +7,27 @@ import pufferlib
 from pufferlib.ocean.grid import binding
 
 class Grid(pufferlib.PufferEnv):
-    def __init__(self, render_mode='raylib', vision_range=5,
-            num_envs=4096, num_maps=1000, map_size=-1, max_size=9,
+    def __init__(self, render_mode='raylib', vision_range=None,
+            num_envs=4096, num_maps=1000, map_size=-1, max_size=9, grid_size=None,
             report_interval=128, buf=None, seed=0):
+        if grid_size is not None:
+            grid_size = int(grid_size)
+            map_size = grid_size
+            max_size = grid_size
+
+        if vision_range is None:
+            if grid_size is not None:
+                # Observation width is 2*vision_range+1, so use the nearest
+                # odd window that does not exceed grid_size.
+                obs_width = grid_size if grid_size % 2 == 1 else grid_size - 1
+                vision_range = obs_width // 2
+            else:
+                vision_range = 5
+
+        vision_range = int(vision_range)
+        if vision_range < 1:
+            raise ValueError('vision_range must be >= 1')
+
         assert map_size <= max_size
         self.obs_size = 2*vision_range + 1
         self.single_observation_space = gymnasium.spaces.Box(low=0, high=255,
@@ -23,7 +41,8 @@ class Grid(pufferlib.PufferEnv):
         self.c_state = binding.shared(num_maps=num_maps, max_size=max_size, size=map_size)
         self.c_envs = binding.vec_init(self.observations, self.float_actions,
             self.rewards, self.terminals, self.truncations, num_envs, seed,
-            state=self.c_state, max_size=max_size, num_maps=num_maps)
+            state=self.c_state, max_size=max_size, num_maps=num_maps,
+            vision_range=vision_range)
         pass
 
     def reset(self, seed=None):

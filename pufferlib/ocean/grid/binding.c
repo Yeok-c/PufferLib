@@ -44,7 +44,18 @@ static PyObject* my_shared(PyObject* self, PyObject* args, PyObject* kwargs) {
 static int my_init(Env* env, PyObject* args, PyObject* kwargs) {
     env->max_size = unpack(kwargs, "max_size");
     env->num_maps = unpack(kwargs, "num_maps");
+    int vision = 5;
+    PyObject* vision_obj = PyDict_GetItemString(kwargs, "vision_range");
+    if (vision_obj != NULL) {
+        vision = (int)unpack(kwargs, "vision_range");
+    }
     init_grid(env);
+    if (vision < 1) {
+        PyErr_SetString(PyExc_ValueError, "vision_range must be >= 1");
+        return 1;
+    }
+    env->vision = vision;
+    env->obs_size = 2*vision + 1;
 
     PyObject* handle_obj = PyDict_GetItemString(kwargs, "state");
     if (!PyObject_TypeCheck(handle_obj, &PyLong_Type)) {

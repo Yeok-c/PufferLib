@@ -7,6 +7,8 @@ import torch.nn as nn
 import pufferlib.emulation
 import pufferlib.pytorch
 import pufferlib.spaces
+from pufferlib.autoencoder import Autoencoder  # noqa: F401
+from pufferlib.unetplusplus import UNet  # noqa: F401
 
 
 class Default(nn.Module):
@@ -96,6 +98,43 @@ class Default(nn.Module):
 
         values = self.value(hidden)
         return logits, values
+
+
+class NoPolicy(nn.Module):
+    """Policy stub for random-action rollouts without learning."""
+
+    def __init__(self, env, *args, **kwargs):
+        super().__init__()
+        self.is_no_policy = True
+        self.hidden_size = 1
+        self.is_multidiscrete = isinstance(env.single_action_space, pufferlib.spaces.MultiDiscrete)
+        self.is_continuous = isinstance(env.single_action_space, pufferlib.spaces.Box)
+        if self.is_multidiscrete:
+            self.action_nvec = tuple(env.single_action_space.nvec)
+        elif not self.is_continuous:
+            self.num_actions = env.single_action_space.n
+        else:
+            self.action_dim = env.single_action_space.shape[0]
+
+        # Keep a state_dict entry so checkpointing remains valid.
+        self._dummy = nn.Parameter(torch.zeros(1), requires_grad=False)
+
+    def forward_eval(self, observations, state=None):
+        batch = observations.shape[0]
+        device = observations.device
+        if self.is_multidiscrete:
+            logits = tuple(torch.zeros(batch, n, device=device) for n in self.action_nvec)
+        elif self.is_continuous:
+            mean = torch.zeros(batch, self.action_dim, device=device)
+            std = torch.ones(batch, self.action_dim, device=device)
+            logits = torch.distributions.Normal(mean, std)
+        else:
+            logits = torch.zeros(batch, self.num_actions, device=device)
+        values = torch.zeros(batch, 1, device=device)
+        return logits, values
+
+    def forward(self, observations, state=None):
+        return self.forward_eval(observations, state)
 
 class LSTMWrapper(nn.Module):
     def __init__(self, env, policy, input_size=128, hidden_size=128):

@@ -1,4 +1,8 @@
 import pufferlib.models
+from pufferlib.environments.policy_wrappers import (
+    Autoencoder as SharedAutoencoder,
+    UNet as SharedUNet,
+)
 
 
 class Recurrent(pufferlib.models.LSTMWrapper):
@@ -16,3 +20,10 @@ class Policy(pufferlib.models.Convolutional):
             framestack=framestack,
             flat_size=flat_size,
         )
+class Autoencoder(SharedAutoencoder):
+    default_channels_last = False
+
+
+class UNet(SharedUNet):
+    default_channels_last = False
+
