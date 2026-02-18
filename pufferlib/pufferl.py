@@ -1047,6 +1047,7 @@ class CsvLogger:
     def __init__(self, args, env_name=None, policy=None, vecenv=None):
         self.run_id = str(int(100*time.time()))
         self.env_name = env_name
+        self.args = args
         self.policy = policy
         self.vecenv = vecenv
         csv_dir = args.get('log_dir')
@@ -1072,6 +1073,8 @@ class CsvLogger:
         self._write_experiment_info_csv(csv_dir)
 
     def _machine_info(self):
+        policy_name = self._policy_name()
+        grid_size = self._grid_size()
         cpu_freq = float('nan')
         try:
             psutil_freq = psutil.cpu_freq()
@@ -1108,6 +1111,8 @@ class CsvLogger:
         info = {
             'run_id': self.run_id,
             'env': self.env_name if self.env_name is not None else '',
+            'policy_name': policy_name,
+            'grid_size': grid_size,
             'timestamp': time.time(),
             'hostname': socket.gethostname(),
             'platform': platform.platform(),
@@ -1149,6 +1154,32 @@ class CsvLogger:
             info['cuda_vram_free_bytes_0'] = free
             info['cuda_power_limit_watts_0'] = self._gpu_power_limit_watts()
         return info
+
+    def _policy_name(self):
+        if hasattr(self.args, 'get'):
+            value = self.args.get('policy_name')
+            if value:
+                return str(value)
+        if self.policy is not None:
+            return self.policy.__class__.__name__
+        return ''
+
+    def _grid_size(self):
+        if not hasattr(self.args, 'get'):
+            return ''
+
+        env_args = self.args.get('env')
+        if hasattr(env_args, 'get'):
+            value = env_args.get('grid_size')
+            if value is not None:
+                return value
+
+        for key in ('env.grid_size', 'env.grid-size', 'grid_size', 'grid-size'):
+            value = self.args.get(key)
+            if value is not None:
+                return value
+
+        return ''
 
     def _model_info(self):
         if self.policy is None:
@@ -1636,6 +1667,8 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, early_stop
 
     # Sweep needs data for early stopped runs, so send data when steps > 100M
     logging_threshold = min(0.20*train_config['total_timesteps'], 100_000_000)
+    max_logging_steps = 10
+    logging_steps = 0
     all_logs = []
 
     while pufferl.global_step < train_config['total_timesteps']:
@@ -1647,6 +1680,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, early_stop
         logs = pufferl.train()
 
         if logs is not None:
+            logging_steps += 1
             should_stop_early = False
             if early_stop_fn is not None:
                 should_stop_early = early_stop_fn(logs)
@@ -1660,6 +1694,11 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, early_stop
             if should_stop_early:
                 model_path = pufferl.close()
                 pufferl.logger.close(model_path, early_stop=True)
+                return all_logs
+
+            if logging_steps >= max_logging_steps:
+                model_path = pufferl.close()
+                pufferl.logger.close(model_path, early_stop=False)
                 return all_logs
 
     # Final eval. You can reset the env here, but depending on
