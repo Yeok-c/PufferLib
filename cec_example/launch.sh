@@ -27,8 +27,8 @@ case "${cmd}" in
       exit 1
     fi
 
-    echo "Evaluating model ${LOAD_MODEL_PATH} and saving gif to ./cec_example/eval.gif"
     LOAD_MODEL_PATH="$2"
+    echo "Evaluating model ${LOAD_MODEL_PATH} and saving gif to ./cec_example/eval.gif"
     puffer eval puffer_racer_simple \
       --save-frames 2000 \
       --gif-path ./cec_example/eval.gif \
