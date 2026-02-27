@@ -7,7 +7,7 @@ from pufferlib.ocean.racer_simple import binding
 
 class RacerSimple(pufferlib.PufferEnv):
     def __init__(self, num_envs=1, render_mode=None,
-                 frameskip=4, width=1080, height=720,
+                 frameskip=2, width=1080, height=720,
                  track_width=75, max_whisker_length=100,
                  num_whiskers=10, w_ang=3.14159, turn_rate=0.0785,
                  maxv=5, min_v=1.0, accel=0.2, decel=0.3,
@@ -75,7 +75,7 @@ class RacerSimple(pufferlib.PufferEnv):
                 self.terminals, self.truncations, info)
 
     def render(self):
-        binding.vec_render(self.c_envs, 0)
+        return binding.vec_render(self.c_envs, 0)
 
     def close(self):
         binding.vec_close(self.c_envs)

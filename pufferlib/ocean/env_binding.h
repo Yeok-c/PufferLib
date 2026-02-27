@@ -544,6 +544,19 @@ static PyObject* vec_render(PyObject* self, PyObject* args) {
     int env_id = PyLong_AsLong(env_id_arg);
  
     c_render(vec->envs[env_id]);
+
+    if (IsWindowReady()) {
+        Image image = LoadImageFromScreen();
+        npy_intp dims[3] = {image.height, image.width, 4};
+        PyObject* array = PyArray_SimpleNew(3, dims, NPY_UINT8);
+        if (array) {
+            memcpy(PyArray_DATA((PyArrayObject*)array),
+                image.data, image.width * image.height * 4);
+        }
+        UnloadImage(image);
+        return array ? array : Py_None;
+    }
+
     Py_RETURN_NONE;
 }
 

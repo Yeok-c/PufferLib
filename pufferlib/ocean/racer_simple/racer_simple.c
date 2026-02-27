@@ -86,7 +86,7 @@ static void npc_world_pos(RacerSimple* env, NPC* npc) {
 
 void spawn_npcs(RacerSimple* env) {
     for (int l = 0; l < NUM_LANES; l++)
-        env->lane_speeds[l] = env->maxv * (0.3f + 0.4f * (rand() % 100) / 100.0f) / 20.0f;
+        env->lane_speeds[l] = env->maxv * (0.3f + 0.4f * (rand() % 100) / 100.0f) / 100.0f;
 
     int spacing = env->total_points / (env->num_npcs > 0 ? env->num_npcs : 1);
     for (int n = 0; n < env->num_npcs; n++) {
@@ -229,8 +229,12 @@ static void update_whisker_dirs(RacerSimple* env) {
         if (full_circle) {
             offset = PI2 * (float)w / nw;
         } else {
-            float frac = (nw > 1) ? (float)w / (nw - 1) : 0.5f;
-            offset = -env->w_ang + 2.0f * env->w_ang * frac;
+            // Map linearly spaced whiskers to a cubic curve in [-1, 1]
+            // to concentrate more rays near the front (offset = 0)
+            float frac = (nw > 1) ? (float)w / (nw - 1) : 0.5f; // [0,1]
+            float t = 2.0f * frac - 1.0f;                       // [-1,1]
+            float shaped = t * t * t;                           // cubic shaping
+            offset = shaped * env->w_ang;                       // [-w_ang, w_ang], denser near 0
         }
         env->whisker_dirs[w] = (Vector2){cosf(env->ang + offset), sinf(env->ang + offset)};
     }
@@ -445,64 +449,99 @@ void free_allocated(RacerSimple* env) {
 #ifdef RACER_SIMPLE_DEMO
 #include <time.h>
 #include <signal.h>
-#include "puffernet.h"
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <errno.h>
+#include <string.h>
 
 static volatile int g_quit = 0;
 static void handle_sigint(int sig) { (void)sig; g_quit = 1; }
 
-void demo() {
-    signal(SIGINT, handle_sigint);
-    int num_whiskers = 10;
-    int input_size = num_whiskers + 2;
-    int hidden = 128;
-    int num_actions = 4;
-    int total_weights = (input_size * hidden + hidden)
-                      + (4 * hidden * hidden + 4 * hidden)
-                      + (hidden + 1)
-                      + (hidden * num_actions + num_actions);
-
-    Weights* weights = NULL;
-    LinearLSTM* net = NULL;
-    const char* weights_path = "resources/racer_simple/puffer_racer_simple_weights.bin";
-    FILE* wf = fopen(weights_path, "rb");
-    if (wf) {
-        fseek(wf, 0, SEEK_END);
-        long file_bytes = ftell(wf);
-        fclose(wf);
-        long expected_bytes = (long)total_weights * (long)sizeof(float);
-        if (file_bytes == expected_bytes) {
-            weights = load_weights(weights_path, total_weights);
-            int logit_sizes[1] = {num_actions};
-            net = make_linearlstm(weights, 1, input_size, logit_sizes, 1);
-        } else {
-            fprintf(stderr, "Warning: weights file wrong size (%ld bytes, expected %ld) -- using random actions\n",
-                    file_bytes, expected_bytes);
-        }
-    } else {
-        fprintf(stderr, "Warning: no weights file found -- using random actions\n");
-        fprintf(stderr, "  Train with: puffer train racer_simple\n");
-        fprintf(stderr, "  Export with: cd pufferlib/ocean/racer_simple && bash build.sh\n");
+static int connect_to_server(const char* host, int port) {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        perror("socket");
+        return -1;
     }
 
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    if (inet_pton(AF_INET, host, &addr.sin_addr) <= 0) {
+        perror("inet_pton");
+        close(sock);
+        return -1;
+    }
+
+    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("connect");
+        close(sock);
+        return -1;
+    }
+    return sock;
+}
+
+static int send_all(int fd, const void* buf, size_t len) {
+    const char* p = (const char*)buf;
+    while (len > 0) {
+        ssize_t n = send(fd, p, len, 0);
+        if (n <= 0) return -1;
+        p += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+static int recv_all(int fd, void* buf, size_t len) {
+    char* p = (char*)buf;
+    while (len > 0) {
+        ssize_t n = recv(fd, p, len, 0);
+        if (n <= 0) return -1;
+        p += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+static int query_action_from_server(int sock, RacerSimple* env, const char* model_path) {
+    (void)model_path; // reserved for protocol extension
+    int32_t count = (int32_t)(env->num_whiskers + 2);
+    if (send_all(sock, &count, sizeof(count)) < 0) return -1;
+    if (send_all(sock, env->observations, sizeof(float) * (size_t)count) < 0) return -1;
+    int32_t action = 0;
+    if (recv_all(sock, &action, sizeof(action)) < 0) return -1;
+    if (action < 0 || action > 3) action = rand() % 4;
+    return action;
+}
+
+static void demo(const char* model_path) {
+    signal(SIGINT, handle_sigint);
+    int num_whiskers = 12;
+    int num_actions = 4;
+
     RacerSimple env = {
-        .frameskip = 1,
+        .frameskip = 2,
         .width = 1080,
         .height = 720,
         .track_width = 75,
-        .max_whisker_length = 100,
+        .max_whisker_length = 300,
         .num_whiskers = num_whiskers,
-        .w_ang = 0.784,
-        .turn_rate = 0.0785,
-        .maxv = 5,
-        .min_v = 1.0,
-        .accel = 0.2,
-        .decel = 0.3,
-        .reward_scale = 1.0,
-        .car_radius = 10,
-        .npc_radius = 10,
-        .num_npcs = 5,
+        .w_ang = 0.784f,
+        .turn_rate = 0.0785f,
+        .maxv = 5.0f,
+        .min_v = 1.0f,
+        .accel = 0.2f,
+        .decel = 0.3f,
+        .reward_scale = 1.0f,
+        .car_radius = 8.0f,
+        .npc_radius = 8.0f,
+        .num_npcs = 6,
         .max_lives = 3,
-        .collision_penalty = 0.2,
+        .collision_penalty = 1.0f,
         .num_points = 16,
         .bezier_resolution = 4,
         .rng = 6,
@@ -514,35 +553,58 @@ void demo() {
     signal(SIGINT, handle_sigint);
     c_reset(&env);
 
+    const char* host = "127.0.0.1";
+    int port = 50051;
+    int sock = -1;
+    if (model_path) {
+        sock = connect_to_server(host, port);
+        if (sock < 0) {
+            fprintf(stderr, "Warning: could not connect to Torch server at %s:%d, using random actions\n",
+                    host, port);
+        }
+    }
+
     int frame = 0;
-    SetTargetFPS(60);
+    SetTargetFPS(30);
     while (!WindowShouldClose() && !g_quit) {
         if (IsKeyDown(KEY_LEFT_SHIFT)) {
             env.actions[0] = ACT_FORWARD;
             if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A)) env.actions[0] = ACT_LEFT;
             if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D)) env.actions[0] = ACT_RIGHT;
             if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S)) env.actions[0] = ACT_BRAKE;
-        } else if (frame % 4 == 0) {
-            if (net) {
-                int* actions = (int*)env.actions;
-                forward_linearlstm(net, env.observations, actions);
-                env.actions[0] = actions[0];
+        } else if (frame % env.frameskip == 0) {
+            if (sock >= 0) {
+                int act = query_action_from_server(sock, &env, model_path);
+                if (act >= 0) {
+                    env.actions[0] = (float)act;
+                } else {
+                    fprintf(stderr, "Warning: server error, falling back to random actions\n");
+                    close(sock);
+                    sock = -1;
+                    env.actions[0] = rand() % num_actions;
+                }
             } else {
                 env.actions[0] = rand() % num_actions;
             }
         }
 
-        frame = (frame + 1) % 4;
+        frame = (frame + 1) % env.frameskip;
         c_step(&env);
         c_render(&env);
     }
 
-    if (net) free_linearlstm(net);
-    if (weights) free(weights);
+    if (sock >= 0) close(sock);
     free_allocated(&env);
 }
 
-int main() {
-    demo();
+int main(int argc, char** argv) {
+    const char* model_path = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--load-model-path") == 0 && i + 1 < argc) {
+            model_path = argv[++i];
+        }
+    }
+    demo(model_path);
+    return 0;
 }
 #endif

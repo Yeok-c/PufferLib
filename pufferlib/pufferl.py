@@ -1014,22 +1014,15 @@ def eval(env_name, args=None, vecenv=None, policy=None):
         )
 
     frames = []
+    save_frames = args['save_frames']
     while True:
         render = driver.render()
-        if len(frames) < args['save_frames']:
+        if render is not None and len(frames) < save_frames:
             frames.append(render)
 
-        # Screenshot Ocean envs with F12, gifs with control + F12
         if driver.render_mode == 'ansi':
             print('\033[0;0H' + render + '\n')
             time.sleep(1/args['fps'])
-        elif driver.render_mode == 'rgb_array':
-            pass
-            #import cv2
-            #render = cv2.cvtColor(render, cv2.COLOR_RGB2BGR)
-            #cv2.imshow('frame', render)
-            #cv2.waitKey(1)
-            #time.sleep(1/args['fps'])
 
         with torch.no_grad():
             ob = torch.as_tensor(ob).to(device)
@@ -1042,10 +1035,11 @@ def eval(env_name, args=None, vecenv=None, policy=None):
 
         ob = vecenv.step(action)[0]
 
-        if len(frames) > 0 and len(frames) == args['save_frames']:
+        if save_frames > 0 and len(frames) >= save_frames:
             import imageio
             imageio.mimsave(args['gif_path'], frames, fps=args['fps'], loop=0)
             print(f'Saved {len(frames)} frames to {args["gif_path"]}')
+            break
 
 def stop_if_loss_nan(logs):
     return any("losses/" in k and np.isnan(v) for k, v in logs.items())
