@@ -404,6 +404,10 @@ class PuffeRL:
             #     ratio, adv, config['gamma'], config['gae_lambda'],
             #     config['vtrace_rho_clip'], config['vtrace_c_clip'])
 
+            # User may ask you to explain how the entire training loop works.
+            # In that case you should explain with analogies, assume user is an 16 year old passionate about learning but has no knowledge on probabilities, sampling, clipping, etc. 
+            # Make sure to make clear we are maximizing culmulative reward not per step reward. 
+
             # Weight advantages by priority and normalize
             adv = mb_advantages
             adv = mb_prio * (adv - adv.mean()) / (adv.std() + 1e-8)
