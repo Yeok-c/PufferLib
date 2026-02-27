@@ -40,7 +40,7 @@ case "${cmd}" in
     LOAD_MODEL_PATH=$(resolve_load_model_path "$@")
     echo "Evaluating model ${LOAD_MODEL_PATH} and saving gif to ./eval.gif"
     puffer eval puffer_racer_simple \
-      --save-frames 500 \
+      --save-frames 2000 \
       --gif-path ./eval.gif \
       --load-model-path "${LOAD_MODEL_PATH}"
     ;;
