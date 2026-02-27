@@ -2,19 +2,14 @@
 name = "pufferlib"
 version = "3.0.0"
 description = "Fast and sane reinforcement learning"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 readme = {file = "README.md", content-type = "text/markdown"}
 license = {text = "MIT"}
 authors = [{ name = "Joseph Suarez", email = "jsuarez@puffer.ai" }]
 classifiers=[
     "Intended Audience :: Science/Research",
     "Intended Audience :: Developers",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
-    "Programming Language :: Python :: 3.14",
 ]
 dynamic = ["dependencies"]
 
@@ -101,26 +96,6 @@ kinetix = [
     'kinetix-env',
 ]
 
-magent = [
-    'gym==0.23',
-    'gymnasium==0.29.1',
-    'pettingzoo==1.19.0',
-    'magent==0.2.4',
-    # The Magent2 package is broken for now
-    #'magent2==0.3.2',
-]
-
-metta = [
-    'gym==0.23',
-    'gymnasium==0.29.1',
-    'omegaconf',
-    'hydra-core',
-    'duckdb',
-    'raylib>=5.5.0',
-    'mettagrid @ git+https://github.com/metta-ai/mettagrid.git',
-    'cogames @ git+https://github.com/metta-ai/cogames.git',
-]
-
 cogames = [
     'gym',
     'gymnasium',
@@ -132,12 +107,6 @@ cogames = [
     'cogames @ git+https://github.com/metta-ai/cogames.git',
 ]
 
-microrts = [
-    'gym==0.23',
-    'gymnasium==0.29.1',
-    'ffmpeg==1.4',
-    'gym_microrts==0.3.2',
-]
 
 minerl = [
     'gym==0.17.0',

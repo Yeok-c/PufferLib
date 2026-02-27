@@ -117,6 +117,7 @@ def make_multiagent(buf=None, **kwargs):
     return pufferlib.emulation.PettingZooPufferEnv(env=env, buf=buf)
 
 MAKE_FUNCTIONS = {
+    'dasm': 'Dasm',
     'battle': 'Battle',
     'breakout': 'Breakout',
     'blastar': 'Blastar',
@@ -156,6 +157,7 @@ MAKE_FUNCTIONS = {
     'checkers': 'Checkers',
     'asteroids': 'Asteroids',
     'whisker_racer': 'WhiskerRacer',
+    'racer_simple': 'RacerSimple',
     'onestateworld': 'World',
     'onlyfish': 'OnlyFish',
     'chain_mdp': 'Chain',
